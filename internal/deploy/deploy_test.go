@@ -239,6 +239,15 @@ func (h *harness) deploy(t *testing.T, id int64) store.Deploy {
 	return d
 }
 
+func (h *harness) currentProject(t *testing.T) store.Project {
+	t.Helper()
+	p, err := h.store.Project(t.Context(), h.project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 // changeEnv changes a var the way the API does, and applies it.
 func (h *harness) changeEnv(t *testing.T, name, value string) store.Deploy {
 	t.Helper()
@@ -253,6 +262,25 @@ func (h *harness) changeEnv(t *testing.T, name, value string) store.Deploy {
 	}
 	h.run(t)
 	return h.deploy(t, queued.ID)
+}
+
+// rollback requests and applies a rollback.
+func (h *harness) rollback(t *testing.T, release *int64) store.Deploy {
+	t.Helper()
+	queued, err := h.pipeline.Rollback(t.Context(), h.currentProject(t), release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.run(t)
+	return h.deploy(t, queued.ID)
+}
+
+// crash makes the live container report restarts crashes in total and runs one
+// round of the watcher.
+func (h *harness) crash(t *testing.T, container string, restarts int, at time.Time) {
+	t.Helper()
+	h.runtime.setState(container, docker.State{Running: true, IP: "10.0.0.2", RestartCount: restarts, FinishedAt: at})
+	h.pipeline.checkCrashes(t.Context())
 }
 
 // push queues a commit and runs the pipeline until the queue is empty.

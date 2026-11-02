@@ -76,6 +76,8 @@ type Timing struct {
 	// Drain is how long the old version stays up after traffic leaves it, so
 	// requests it was serving can finish.
 	Drain time.Duration
+	// WatchInterval is how often live containers are checked for crashes.
+	WatchInterval time.Duration
 }
 
 // DefaultTiming is what Shipit runs with.
@@ -84,6 +86,7 @@ func DefaultTiming() Timing {
 		HealthInterval: time.Second,
 		HealthTimeout:  time.Minute,
 		Drain:          2 * time.Second,
+		WatchInterval:  3 * time.Second,
 	}
 }
 
@@ -130,7 +133,7 @@ func (p *Pipeline) Wake() {
 	}
 }
 
-// Run works through the queue until ctx ends.
+// Run works through the queue and watches live containers until ctx ends.
 //
 // One build runs at a time, across all projects, so builds never compete for
 // the server. Env changes and rollbacks have their own worker: they don't build,
@@ -140,6 +143,7 @@ func (p *Pipeline) Run(ctx context.Context) {
 	for lane := range p.wakes {
 		workers.Go(func() { p.work(ctx, lane) })
 	}
+	workers.Go(func() { p.watch(ctx) })
 	workers.Wait()
 }
 
