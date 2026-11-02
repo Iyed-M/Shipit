@@ -190,6 +190,54 @@ func TestSupersedingStaysWithinOneProject(t *testing.T) {
 	}
 }
 
+func TestKeepsLastThreeImages(t *testing.T) {
+	h := newHarness(t)
+	var images []string
+	for _, delivery := range []string{"a", "b", "c", "d", "e"} {
+		images = append(images, h.push(t, delivery).Image)
+	}
+
+	if !slices.Equal(h.runtime.removedImages, images[:2]) {
+		t.Errorf("removed images = %v, want %v", h.runtime.removedImages, images[:2])
+	}
+	releases, err := h.store.Releases(t.Context(), h.project.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 3 {
+		t.Errorf("releases = %d, want 3", len(releases))
+	}
+}
+
+func TestEnvReleasesShareAnImageForRetention(t *testing.T) {
+	h := newHarness(t)
+	first := h.push(t, "a")
+	for _, value := range []string{"1", "2", "3", "4"} {
+		h.changeEnv(t, "N", value)
+	}
+
+	if slices.Contains(h.runtime.removedImages, first.Image) {
+		t.Error("removed the image still serving")
+	}
+}
+
+func TestFailedDeploysDontPushOutGoodImages(t *testing.T) {
+	h := newHarness(t)
+	good := []string{h.push(t, "a").Image, h.push(t, "b").Image, h.push(t, "c").Image}
+	h.prober.err = errors.New("unhealthy")
+	bad := h.push(t, "d")
+	h.push(t, "e")
+
+	for _, image := range good {
+		if slices.Contains(h.runtime.removedImages, image) {
+			t.Errorf("removed good image %s", image)
+		}
+	}
+	if !slices.Contains(h.runtime.removedImages, bad.Image) {
+		t.Errorf("kept failed image %s", bad.Image)
+	}
+}
+
 func TestFailedTestsRemoveTheImage(t *testing.T) {
 	h := newHarness(t)
 	h.source.files["shipit.toml"] = "[test]\ncommand = \"false\"\n"

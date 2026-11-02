@@ -26,6 +26,8 @@ const (
 	testTimeout  = 10 * time.Minute
 	stepTimeout  = 2 * time.Minute
 
+	// keepImages is how many images each project keeps for rollbacks (R4).
+	keepImages = 3
 	// failureLogLines is how much of a failed app's output goes in the deploy log.
 	failureLogLines = 200
 
@@ -261,6 +263,7 @@ func (p *Pipeline) deploy(ctx context.Context, d store.Deploy) {
 		logger.Info("deploy live")
 	}
 	p.finish(ctx, project, d, err)
+	p.prune(context.WithoutCancel(ctx), project)
 }
 
 // finish records a deploy's outcome. It ignores cancellation of ctx, so a
@@ -514,6 +517,27 @@ func (p *Pipeline) retire(ctx context.Context, project store.Project, d store.De
 		p.log.Error("mark deploy rolled back", "deploy", previous.ID, "err", err)
 	}
 	p.report(ctx, project, previous, github.StateFailure, "Rolled back")
+}
+
+// prune deletes images no release needs any more (R4).
+func (p *Pipeline) prune(ctx context.Context, project store.Project) {
+	p.activation.Lock()
+	defer p.activation.Unlock()
+
+	stale, err := p.store.StaleReleases(ctx, project.ID, keepImages)
+	if err != nil {
+		p.log.Warn("list stale releases", "project", project.Name, "err", err)
+		return
+	}
+	for _, r := range stale {
+		if err := p.runtime.RemoveImage(ctx, r.Image); err != nil {
+			p.log.Warn("remove image", "image", r.Image, "err", err)
+			continue
+		}
+		if err := p.store.DeleteRelease(ctx, r.ID); err != nil {
+			p.log.Warn("delete release", "release", r.ID, "err", err)
+		}
+	}
 }
 
 // switchTraffic points the project at d. If Caddy refuses, the database goes
