@@ -300,7 +300,13 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deploy, created, err := s.store.EnqueueDeploy(r.Context(), project.ID, push.After, firstLine(push.HeadCommit.Message), delivery)
+	deploy, created, err := s.store.EnqueueDeploy(r.Context(), store.NewDeploy{
+		ProjectID: project.ID,
+		Kind:      store.KindPush,
+		CommitSHA: push.After,
+		Message:   firstLine(push.HeadCommit.Message),
+		Key:       delivery,
+	})
 	if err != nil {
 		s.internalError(w, "queue deploy", err)
 		return

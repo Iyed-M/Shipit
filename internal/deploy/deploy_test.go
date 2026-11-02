@@ -89,7 +89,7 @@ func newHarness(t *testing.T) *harness {
 	if err := os.MkdirAll(filepath.Join(dir, "builds"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(filepath.Join(dir, "shipit.db"))
+	s, err := store.Open(filepath.Join(dir, "shipit.db"), make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func newHarness(t *testing.T) *harness {
 // push queues a commit and runs the pipeline until the queue is empty.
 func (h *harness) push(t *testing.T, delivery string) store.Deploy {
 	t.Helper()
-	queued, created, err := h.store.EnqueueDeploy(t.Context(), h.project.ID, sha, "msg", delivery)
+	queued, created, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{ProjectID: h.project.ID, Kind: store.KindPush, CommitSHA: sha, Message: "msg", Key: delivery})
 	if err != nil || !created {
 		t.Fatalf("enqueue: created=%v err=%v", created, err)
 	}
@@ -290,7 +290,7 @@ func TestRecoverFailsInterruptedDeploys(t *testing.T) {
 	h := newHarness(t)
 	good := h.push(t, "good")
 
-	stuck, _, err := h.store.EnqueueDeploy(t.Context(), h.project.ID, sha, "msg", "stuck")
+	stuck, _, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{ProjectID: h.project.ID, Kind: store.KindPush, CommitSHA: sha, Message: "msg", Key: "stuck"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestRecoverFailsInterruptedDeploys(t *testing.T) {
 
 func TestCancelledDeployIsRecorded(t *testing.T) {
 	h := newHarness(t)
-	queued, _, err := h.store.EnqueueDeploy(t.Context(), h.project.ID, sha, "msg", "a")
+	queued, _, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{ProjectID: h.project.ID, Kind: store.KindPush, CommitSHA: sha, Message: "msg", Key: "a"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -56,7 +56,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "shipit.db"))
+	s, err := store.Open(filepath.Join(t.TempDir(), "shipit.db"), make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
 	}

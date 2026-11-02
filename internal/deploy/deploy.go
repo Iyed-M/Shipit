@@ -101,7 +101,7 @@ func (p *Pipeline) Run(ctx context.Context) {
 
 func (p *Pipeline) drain(ctx context.Context) {
 	for ctx.Err() == nil {
-		d, err := p.store.NextQueued(ctx)
+		d, err := p.store.NextQueued(ctx, store.LaneBuild)
 		if errors.Is(err, store.ErrNotFound) {
 			return
 		}
