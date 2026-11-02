@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Iyed-M/Shipit/internal/deploy"
 	"github.com/Iyed-M/Shipit/internal/github"
 	"github.com/Iyed-M/Shipit/internal/store"
 )
@@ -41,10 +43,22 @@ func (f *fakeRouter) Sync(context.Context) error {
 	return nil
 }
 
-type fakeQueue struct{ wakes int }
+type fakeQueue struct {
+	wakes       int
+	rollbacks   []*int64
+	rollbackErr error
+}
 
 func (f *fakeQueue) Wake()                { f.wakes++ }
 func (f *fakeQueue) LogPath(int64) string { return "/nonexistent" }
+
+func (f *fakeQueue) Rollback(_ context.Context, project store.Project, releaseID *int64) (store.Deploy, error) {
+	f.rollbacks = append(f.rollbacks, releaseID)
+	if f.rollbackErr != nil {
+		return store.Deploy{}, f.rollbackErr
+	}
+	return store.Deploy{ProjectID: project.ID, Kind: store.KindRollback}, nil
+}
 
 type harness struct {
 	store   *store.Store
@@ -270,5 +284,169 @@ func TestWebhookUnknownProject(t *testing.T) {
 	h := newHarness(t)
 	if rec := h.webhook("push", "d1", "", "{}"); rec.Code != http.StatusNotFound {
 		t.Errorf("code = %d", rec.Code)
+	}
+}
+
+func (h *harness) request(method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// seedLive gives the project a deploy that is serving.
+func (h *harness) seedLive(t *testing.T, project store.Project) store.Deploy {
+	t.Helper()
+	d, _, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{
+		ProjectID: project.ID, Kind: store.KindPush, CommitSHA: "abc", Key: "seed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.FinishDeploy(t.Context(), d.ID, store.StatusLive, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetLiveDeploy(t.Context(), project.ID, &d.ID); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func TestEnvNeverReturnsValues(t *testing.T) {
+	h := newHarness(t)
+	h.seedProject(t)
+
+	rec := h.request(http.MethodPatch, "/api/projects/demo/env", `{"B_KEY":"hunter2","A_KEY":"x"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d: %s", rec.Code, rec.Body)
+	}
+	for _, rec := range []*httptest.ResponseRecorder{rec, h.request(http.MethodGet, "/api/projects/demo/env", "")} {
+		if strings.Contains(rec.Body.String(), "hunter2") {
+			t.Errorf("response leaks a value: %s", rec.Body)
+		}
+		if !strings.Contains(rec.Body.String(), `"keys":["A_KEY","B_KEY"]`) {
+			t.Errorf("body = %s", rec.Body)
+		}
+	}
+}
+
+func TestEnvChangeWithNothingLiveOnlySaves(t *testing.T) {
+	h := newHarness(t)
+	project := h.seedProject(t)
+
+	h.request(http.MethodPatch, "/api/projects/demo/env", `{"KEY":"value"}`)
+
+	deploys, err := h.store.Deploys(t.Context(), project.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deploys) != 0 {
+		t.Errorf("deploys = %+v, want none", deploys)
+	}
+}
+
+func TestEnvChangeQueuesDeploy(t *testing.T) {
+	h := newHarness(t)
+	project := h.seedProject(t)
+	h.seedLive(t, project)
+
+	rec := h.request(http.MethodPatch, "/api/projects/demo/env", `{"KEY":"value"}`)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d: %s", rec.Code, rec.Body)
+	}
+	deploys, err := h.store.Deploys(t.Context(), project.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deploys[0].Kind != store.KindEnv || deploys[0].Status != store.StatusQueued || deploys[0].CommitSHA != "abc" {
+		t.Errorf("deploy = %+v", deploys[0])
+	}
+	if h.queue.wakes != 1 {
+		t.Errorf("wakes = %d", h.queue.wakes)
+	}
+}
+
+func TestEnvNullRemovesVariable(t *testing.T) {
+	h := newHarness(t)
+	project := h.seedProject(t)
+
+	h.request(http.MethodPatch, "/api/projects/demo/env", `{"KEEP":"1","DROP":"2"}`)
+	h.request(http.MethodPatch, "/api/projects/demo/env", `{"DROP":null}`)
+
+	env, err := h.store.Env(t.Context(), project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env) != 1 || env["KEEP"] != "1" {
+		t.Errorf("env = %v", env)
+	}
+}
+
+func TestEnvRejections(t *testing.T) {
+	h := newHarness(t)
+	h.seedProject(t)
+
+	for name, body := range map[string]string{
+		"not JSON":    `nope`,
+		"no changes":  `{}`,
+		"bad name":    `{"NOT VALID":"x"}`,
+		"reserved":    `{"PORT":"8000"}`,
+		"not a value": `{"KEY":1}`,
+		"NUL byte":    `{"KEY":"a\u0000b"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if rec := h.request(http.MethodPatch, "/api/projects/demo/env", body); rec.Code != http.StatusBadRequest {
+				t.Errorf("code = %d: %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+func TestRollback(t *testing.T) {
+	h := newHarness(t)
+	h.seedProject(t)
+
+	rec := h.request(http.MethodPost, "/api/projects/demo/rollback", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("code = %d: %s", rec.Code, rec.Body)
+	}
+	if h.request(http.MethodPost, "/api/projects/demo/rollback", `{"release_id":7}`).Code != http.StatusAccepted {
+		t.Fatal("rollback with a release id refused")
+	}
+	if h.queue.rollbacks[0] != nil || *h.queue.rollbacks[1] != 7 {
+		t.Errorf("rollbacks = %v", h.queue.rollbacks)
+	}
+}
+
+func TestRollbackWithoutTargetConflicts(t *testing.T) {
+	h := newHarness(t)
+	h.seedProject(t)
+	h.queue.rollbackErr = deploy.ErrNoRollbackTarget
+
+	if rec := h.request(http.MethodPost, "/api/projects/demo/rollback", ""); rec.Code != http.StatusConflict {
+		t.Errorf("code = %d: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestListCrashesAndReleases(t *testing.T) {
+	h := newHarness(t)
+	project := h.seedProject(t)
+	d := h.seedLive(t, project)
+	if err := h.store.RecordCrashes(t.Context(), d.ID, 2, 2, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	var crashes []store.Crash
+	rec := h.request(http.MethodGet, "/api/projects/demo/crashes", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &crashes); err != nil {
+		t.Fatalf("%v: %s", err, rec.Body)
+	}
+	if len(crashes) != 2 {
+		t.Errorf("crashes = %+v", crashes)
+	}
+	if rec := h.request(http.MethodGet, "/api/projects/demo/releases", ""); strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Errorf("releases = %s", rec.Body)
 	}
 }

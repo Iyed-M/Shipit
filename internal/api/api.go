@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/Iyed-M/Shipit/internal/deploy"
 	"github.com/Iyed-M/Shipit/internal/github"
 	"github.com/Iyed-M/Shipit/internal/store"
 )
@@ -27,9 +29,14 @@ const (
 	maxBodyBytes    = 1 << 20
 	deployListLimit = 50
 	defaultBranch   = "main"
+	// reservedEnvVar is set by Shipit, which decides the port apps listen on.
+	reservedEnvVar = "PORT"
 )
 
-var projectName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+var (
+	projectName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	envVarName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+)
 
 // GitHub is the part of the GitHub client the API needs.
 type GitHub interface {
@@ -41,10 +48,11 @@ type Router interface {
 	Sync(ctx context.Context) error
 }
 
-// Queue is notified of new deploys and knows where their logs are.
+// Queue is notified of new deploys, queues rollbacks and knows where logs are.
 type Queue interface {
 	Wake()
 	LogPath(id int64) string
+	Rollback(ctx context.Context, project store.Project, releaseID *int64) (store.Deploy, error)
 }
 
 // Config holds the API's settings.
@@ -83,6 +91,11 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/projects", s.listProjects)
 	api.HandleFunc("GET /api/projects/{project}", s.getProject)
 	api.HandleFunc("GET /api/projects/{project}/deploys", s.listDeploys)
+	api.HandleFunc("GET /api/projects/{project}/releases", s.listReleases)
+	api.HandleFunc("GET /api/projects/{project}/crashes", s.listCrashes)
+	api.HandleFunc("GET /api/projects/{project}/env", s.getEnv)
+	api.HandleFunc("PATCH /api/projects/{project}/env", s.updateEnv)
+	api.HandleFunc("POST /api/projects/{project}/rollback", s.rollback)
 	api.HandleFunc("GET /api/deploys/{id}", s.getDeploy)
 	api.HandleFunc("GET /api/deploys/{id}/logs", s.getDeployLogs)
 	mux.Handle("/api/", s.requireAdmin(api))
@@ -222,12 +235,156 @@ func (s *Server) listDeploys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, deploys)
 }
 
-func (s *Server) getDeploy(w http.ResponseWriter, r *http.Request) {
-	deploy, ok := s.loadDeploy(w, r)
+func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
+	project, ok := s.loadProject(w, r)
 	if !ok {
 		return
 	}
-	stages, err := s.store.Stages(r.Context(), deploy.ID)
+	releases, err := s.store.Releases(r.Context(), project.ID, deployListLimit)
+	if err != nil {
+		s.internalError(w, "list releases", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, releases)
+}
+
+func (s *Server) listCrashes(w http.ResponseWriter, r *http.Request) {
+	project, ok := s.loadProject(w, r)
+	if !ok {
+		return
+	}
+	crashes, err := s.store.Crashes(r.Context(), project.ID, deployListLimit)
+	if err != nil {
+		s.internalError(w, "list crashes", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, crashes)
+}
+
+// envResponse never carries values: they can be replaced but not read back.
+type envResponse struct {
+	Keys []string `json:"keys"`
+	// Deploy is the deploy applying the change, if something is live.
+	Deploy *store.Deploy `json:"deploy,omitempty"`
+}
+
+func envKeys(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+func (s *Server) getEnv(w http.ResponseWriter, r *http.Request) {
+	project, ok := s.loadProject(w, r)
+	if !ok {
+		return
+	}
+	env, err := s.store.Env(r.Context(), project.ID)
+	if err != nil {
+		s.internalError(w, "read env vars", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, envResponse{Keys: envKeys(env)})
+}
+
+// updateEnv applies a JSON merge patch: a string sets a variable and null
+// removes it. If a release is live, the change goes out as a new release.
+func (s *Server) updateEnv(w http.ResponseWriter, r *http.Request) {
+	project, ok := s.loadProject(w, r)
+	if !ok {
+		return
+	}
+	var changes map[string]*string
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&changes); err != nil {
+		writeError(w, http.StatusBadRequest, "body must be a JSON object of strings or nulls")
+		return
+	}
+	if len(changes) == 0 {
+		writeError(w, http.StatusBadRequest, "no changes")
+		return
+	}
+	for name, value := range changes {
+		if !envVarName.MatchString(name) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid env var name %q", name))
+			return
+		}
+		if name == reservedEnvVar {
+			writeError(w, http.StatusBadRequest, reservedEnvVar+" is set by Shipit")
+			return
+		}
+		if value != nil && strings.ContainsRune(*value, 0) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("env var %q contains a NUL byte", name))
+			return
+		}
+	}
+
+	env, err := s.store.UpdateEnv(r.Context(), project.ID, changes)
+	if err != nil {
+		s.internalError(w, "update env vars", err)
+		return
+	}
+	if project.LiveDeployID == nil {
+		writeJSON(w, http.StatusOK, envResponse{Keys: envKeys(env)})
+		return
+	}
+
+	live, err := s.store.Deploy(r.Context(), *project.LiveDeployID)
+	if err != nil {
+		s.internalError(w, "load live deploy", err)
+		return
+	}
+	d, _, err := s.store.EnqueueDeploy(r.Context(), store.NewDeploy{
+		ProjectID: project.ID,
+		Kind:      store.KindEnv,
+		CommitSHA: live.CommitSHA,
+		Message:   "Update env vars",
+	})
+	if err != nil {
+		s.internalError(w, "queue deploy", err)
+		return
+	}
+	s.queue.Wake()
+	writeJSON(w, http.StatusAccepted, envResponse{Keys: envKeys(env), Deploy: &d})
+}
+
+type rollbackRequest struct {
+	// ReleaseID defaults to the release that was live before the current one.
+	ReleaseID *int64 `json:"release_id"`
+}
+
+func (s *Server) rollback(w http.ResponseWriter, r *http.Request) {
+	project, ok := s.loadProject(w, r)
+	if !ok {
+		return
+	}
+	var req rollbackRequest
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req)
+	if err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	d, err := s.queue.Rollback(r.Context(), project, req.ReleaseID)
+	if errors.Is(err, deploy.ErrNoRollbackTarget) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err != nil {
+		s.internalError(w, "queue rollback", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, d)
+}
+
+func (s *Server) getDeploy(w http.ResponseWriter, r *http.Request) {
+	d, ok := s.loadDeploy(w, r)
+	if !ok {
+		return
+	}
+	stages, err := s.store.Stages(r.Context(), d.ID)
 	if err != nil {
 		s.internalError(w, "list stages", err)
 		return
@@ -235,15 +392,15 @@ func (s *Server) getDeploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		store.Deploy
 		Stages []store.Stage `json:"stages"`
-	}{deploy, stages})
+	}{d, stages})
 }
 
 func (s *Server) getDeployLogs(w http.ResponseWriter, r *http.Request) {
-	deploy, ok := s.loadDeploy(w, r)
+	d, ok := s.loadDeploy(w, r)
 	if !ok {
 		return
 	}
-	file, err := os.Open(s.queue.LogPath(deploy.ID))
+	file, err := os.Open(s.queue.LogPath(d.ID))
 	if errors.Is(err, os.ErrNotExist) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		return
@@ -300,7 +457,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deploy, created, err := s.store.EnqueueDeploy(r.Context(), store.NewDeploy{
+	d, created, err := s.store.EnqueueDeploy(r.Context(), store.NewDeploy{
 		ProjectID: project.ID,
 		Kind:      store.KindPush,
 		CommitSHA: push.After,
@@ -316,7 +473,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.queue.Wake()
-	writeJSON(w, http.StatusAccepted, deploy)
+	writeJSON(w, http.StatusAccepted, d)
 }
 
 func (s *Server) loadProject(w http.ResponseWriter, r *http.Request) (store.Project, bool) {
@@ -338,7 +495,7 @@ func (s *Server) loadDeploy(w http.ResponseWriter, r *http.Request) (store.Deplo
 		writeError(w, http.StatusNotFound, "deploy not found")
 		return store.Deploy{}, false
 	}
-	deploy, err := s.store.Deploy(r.Context(), id)
+	d, err := s.store.Deploy(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "deploy not found")
 		return store.Deploy{}, false
@@ -347,7 +504,7 @@ func (s *Server) loadDeploy(w http.ResponseWriter, r *http.Request) (store.Deplo
 		s.internalError(w, "load deploy", err)
 		return store.Deploy{}, false
 	}
-	return deploy, true
+	return d, true
 }
 
 func (s *Server) internalError(w http.ResponseWriter, action string, err error) {
