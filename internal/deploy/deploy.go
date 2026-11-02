@@ -154,6 +154,10 @@ func (p *Pipeline) work(ctx context.Context, lane store.Lane) {
 
 func (p *Pipeline) drain(ctx context.Context, lane store.Lane) {
 	for ctx.Err() == nil {
+		if err := p.supersede(ctx, lane); err != nil {
+			p.log.Error("supersede queued deploys", "err", err)
+			return
+		}
 		d, err := p.store.NextQueued(ctx, lane)
 		if errors.Is(err, store.ErrNotFound) {
 			return
@@ -164,6 +168,26 @@ func (p *Pipeline) drain(ctx context.Context, lane store.Lane) {
 		}
 		p.deploy(ctx, d)
 	}
+}
+
+// supersede drops queued deploys that a newer one makes pointless (D6).
+func (p *Pipeline) supersede(ctx context.Context, lane store.Lane) error {
+	deploys, err := p.store.SupersededDeploys(ctx, lane)
+	if err != nil {
+		return err
+	}
+	for _, d := range deploys {
+		if err := p.store.FinishDeploy(ctx, d.ID, store.StatusSuperseded, "a newer deploy replaced it in the queue"); err != nil {
+			return err
+		}
+		project, err := p.store.Project(ctx, d.ProjectID)
+		if err != nil {
+			return err
+		}
+		// Not a failure of the commit, so it shouldn't show a red cross.
+		p.report(ctx, project, d, github.StateSuccess, "Superseded by a newer commit")
+	}
+	return nil
 }
 
 // Recover clears up deploys left mid-pipeline by a previous process. If one had

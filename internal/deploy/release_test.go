@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Iyed-M/Shipit/internal/github"
 	"github.com/Iyed-M/Shipit/internal/store"
 )
 
@@ -140,6 +141,52 @@ func TestEnvChangeDoesNotPostCommitStatus(t *testing.T) {
 
 	if len(h.source.statuses) != 0 {
 		t.Errorf("statuses = %v", h.source.statuses)
+	}
+}
+
+func TestOnlyNewestQueuedCommitIsBuilt(t *testing.T) {
+	h := newHarness(t)
+	older := h.enqueue(t, "a")
+	middle := h.enqueue(t, "b")
+	newest := h.enqueue(t, "c")
+
+	h.run(t)
+
+	for _, d := range []store.Deploy{older, middle} {
+		if got := h.deploy(t, d.ID); got.Status != store.StatusSuperseded {
+			t.Errorf("deploy %d = %s, want superseded", d.ID, got.Status)
+		}
+	}
+	if got := h.deploy(t, newest.ID).Status; got != store.StatusLive {
+		t.Errorf("newest = %s", got)
+	}
+	if h.runtime.builds != 1 {
+		t.Errorf("builds = %d, want 1", h.runtime.builds)
+	}
+	if h.source.statuses[0] != github.StateSuccess || h.source.details[0] != "Superseded by a newer commit" {
+		t.Errorf("first status = %s %q", h.source.statuses[0], h.source.details[0])
+	}
+}
+
+func TestSupersedingStaysWithinOneProject(t *testing.T) {
+	h := newHarness(t)
+	other, err := h.store.CreateProject(t.Context(), store.Project{
+		Name: "other", RepoOwner: "o", RepoName: "x", Branch: "main", WebhookSecret: "s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := h.enqueue(t, "a")
+	if _, _, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{
+		ProjectID: other.ID, Kind: store.KindPush, CommitSHA: sha, Key: "b",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.run(t)
+
+	if got := h.deploy(t, first.ID).Status; got != store.StatusLive {
+		t.Errorf("deploy = %s, want live", got)
 	}
 }
 
