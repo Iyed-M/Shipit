@@ -454,12 +454,6 @@ func (s *Store) AssignRelease(ctx context.Context, id int64, r Release, containe
 	return err
 }
 
-// SetArtifacts records the image and container a deploy produced.
-func (s *Store) SetArtifacts(ctx context.Context, id int64, image, container string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE deploys SET image = ?, container = ? WHERE id = ?`, image, container, id)
-	return err
-}
-
 // FinishDeploy moves a deploy to a final status.
 func (s *Store) FinishDeploy(ctx context.Context, id int64, status Status, reason string) error {
 	tx, err := s.db.BeginTx(ctx, nil)

@@ -64,7 +64,8 @@ func run(log *slog.Logger) error {
 		DataDir:     cfg.DataDir,
 		AppsNetwork: cfg.AppsNetwork,
 		Domain:      cfg.Domain,
-	}, db, docker.CLI{}, gh, router, log)
+		Timing:      deploy.DefaultTiming(),
+	}, db, docker.CLI{}, deploy.NetworkProber{}, gh, router, log)
 
 	if err := pipeline.Recover(ctx); err != nil {
 		return err
