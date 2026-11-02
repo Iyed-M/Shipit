@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"crypto/cipher"
 	"database/sql"
 	"embed"
 	"errors"
@@ -40,6 +41,37 @@ const (
 	StatusRolledBack     Status = "rolled back"
 )
 
+// Kind says what started a deploy. All kinds end on the same path: a release is
+// started, health-checked and given traffic.
+type Kind string
+
+// Deploy kinds.
+const (
+	// KindPush builds a commit into a new release.
+	KindPush Kind = "push"
+	// KindEnv makes a new release from the live image and the current env vars.
+	KindEnv Kind = "env"
+	// KindRollback brings back an earlier release, with its own env vars.
+	KindRollback Kind = "rollback"
+)
+
+// Lane is a class of queued deploys, worked through independently so a long
+// build can't hold up a rollback.
+type Lane int
+
+// Queue lanes.
+const (
+	LaneBuild Lane = iota
+	LaneRelease
+)
+
+func (l Lane) where() string {
+	if l == LaneBuild {
+		return `kind = 'push'`
+	}
+	return `kind <> 'push'`
+}
+
 // Project is a GitHub repo deployed to its own address.
 type Project struct {
 	ID            int64     `json:"id"`
@@ -55,16 +87,36 @@ type Project struct {
 
 // Deploy is one attempt to take a commit live.
 type Deploy struct {
-	ID            int64      `json:"id"`
-	ProjectID     int64      `json:"project_id"`
-	CommitSHA     string     `json:"commit_sha"`
-	CommitMessage string     `json:"commit_message"`
-	Status        Status     `json:"status"`
-	Error         string     `json:"error,omitempty"`
-	Image         string     `json:"image,omitempty"`
-	Container     string     `json:"container,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	ID            int64  `json:"id"`
+	ProjectID     int64  `json:"project_id"`
+	Kind          Kind   `json:"kind"`
+	CommitSHA     string `json:"commit_sha"`
+	CommitMessage string `json:"commit_message"`
+	Status        Status `json:"status"`
+	Error         string `json:"error,omitempty"`
+	Image         string `json:"image,omitempty"`
+	Container     string `json:"container,omitempty"`
+	ReleaseID     *int64 `json:"release_id,omitempty"`
+	// PreviousDeployID is the deploy this one replaces when it goes live.
+	PreviousDeployID *int64     `json:"previous_deploy_id,omitempty"`
+	Restarts         int        `json:"restarts"`
+	CreatedAt        time.Time  `json:"created_at"`
+	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+}
+
+// NewDeploy is a deploy to queue.
+type NewDeploy struct {
+	ProjectID int64
+	Kind      Kind
+	CommitSHA string
+	Message   string
+	// Key makes queuing idempotent: a key already used queues nothing. It is
+	// optional.
+	Key string
+	// ReleaseID is the release a rollback restores.
+	ReleaseID *int64
+	// PreviousDeployID is the deploy a rollback is meant to replace.
+	PreviousDeployID *int64
 }
 
 // Stage records when a deploy entered a status.
@@ -82,11 +134,18 @@ type Route struct {
 
 // Store is the SQLite database.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	aead cipher.AEAD
 }
 
-// Open opens the database at path and applies pending migrations.
-func Open(path string) (*Store, error) {
+// Open opens the database at path and applies pending migrations. masterKey
+// must be 32 bytes; it seals env vars, which are never stored in the clear.
+func Open(path string, masterKey []byte) (*Store, error) {
+	aead, err := newCipher(masterKey)
+	if err != nil {
+		return nil, err
+	}
+
 	dsn := (&url.URL{
 		Scheme: "file",
 		Opaque: path,
@@ -106,7 +165,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, aead: aead}, nil
 }
 
 // Close closes the database.
@@ -255,7 +314,8 @@ func (s *Store) Routes(ctx context.Context) ([]Route, error) {
 	return routes, rows.Err()
 }
 
-const deployColumns = `id, project_id, commit_sha, commit_message, status, error, image, container, created_at, finished_at`
+const deployColumns = `id, project_id, kind, commit_sha, commit_message, status, error, image, container,
+	release_id, previous_deploy_id, restarts, created_at, finished_at`
 
 func scanDeploy(row interface{ Scan(...any) error }) (Deploy, error) {
 	var (
@@ -263,8 +323,8 @@ func scanDeploy(row interface{ Scan(...any) error }) (Deploy, error) {
 		created  int64
 		finished sql.NullInt64
 	)
-	err := row.Scan(&d.ID, &d.ProjectID, &d.CommitSHA, &d.CommitMessage, &d.Status,
-		&d.Error, &d.Image, &d.Container, &created, &finished)
+	err := row.Scan(&d.ID, &d.ProjectID, &d.Kind, &d.CommitSHA, &d.CommitMessage, &d.Status,
+		&d.Error, &d.Image, &d.Container, &d.ReleaseID, &d.PreviousDeployID, &d.Restarts, &created, &finished)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deploy{}, ErrNotFound
 	}
@@ -279,8 +339,8 @@ func scanDeploy(row interface{ Scan(...any) error }) (Deploy, error) {
 	return d, nil
 }
 
-// EnqueueDeploy queues a commit. It returns false if deliveryID was already seen.
-func (s *Store) EnqueueDeploy(ctx context.Context, projectID int64, sha, message, deliveryID string) (Deploy, bool, error) {
+// EnqueueDeploy queues a deploy. It returns false if its key was already used.
+func (s *Store) EnqueueDeploy(ctx context.Context, n NewDeploy) (Deploy, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Deploy{}, false, err
@@ -289,11 +349,13 @@ func (s *Store) EnqueueDeploy(ctx context.Context, projectID int64, sha, message
 
 	at := now()
 	d, err := scanDeploy(tx.QueryRowContext(ctx, `
-		INSERT INTO deploys (project_id, commit_sha, commit_message, delivery_id, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO deploys (project_id, kind, commit_sha, commit_message, delivery_id,
+			release_id, previous_deploy_id, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (delivery_id) DO NOTHING
 		RETURNING `+deployColumns,
-		projectID, sha, message, deliveryID, StatusQueued, at))
+		n.ProjectID, n.Kind, n.CommitSHA, n.Message, sql.NullString{String: n.Key, Valid: n.Key != ""},
+		n.ReleaseID, n.PreviousDeployID, StatusQueued, at))
 	if errors.Is(err, ErrNotFound) {
 		return Deploy{}, false, nil
 	}
@@ -333,10 +395,37 @@ func (s *Store) Deploys(ctx context.Context, projectID int64, limit int) ([]Depl
 	return deploys, rows.Err()
 }
 
-// NextQueued returns the oldest queued deploy, or ErrNotFound if none is waiting.
-func (s *Store) NextQueued(ctx context.Context) (Deploy, error) {
+// NextQueued returns a lane's oldest queued deploy, or ErrNotFound if none is waiting.
+func (s *Store) NextQueued(ctx context.Context, lane Lane) (Deploy, error) {
 	return scanDeploy(s.db.QueryRowContext(ctx,
-		`SELECT `+deployColumns+` FROM deploys WHERE status = ? ORDER BY id LIMIT 1`, StatusQueued))
+		`SELECT `+deployColumns+` FROM deploys WHERE status = ? AND `+lane.where()+` ORDER BY id LIMIT 1`,
+		StatusQueued))
+}
+
+// SupersededDeploys returns a lane's queued deploys that a newer queued deploy
+// of the same project and kind makes pointless. Rollbacks each name their own
+// target, so they are never superseded.
+func (s *Store) SupersededDeploys(ctx context.Context, lane Lane) ([]Deploy, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+deployColumns+` FROM deploys
+		WHERE status = ? AND `+lane.where()+` AND kind <> ? AND id < (
+			SELECT MAX(n.id) FROM deploys n
+			WHERE n.project_id = deploys.project_id AND n.kind = deploys.kind AND n.status = ?)
+		ORDER BY id`, StatusQueued, KindRollback, StatusQueued)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var deploys []Deploy
+	for rows.Next() {
+		d, err := scanDeploy(rows)
+		if err != nil {
+			return nil, err
+		}
+		deploys = append(deploys, d)
+	}
+	return deploys, rows.Err()
 }
 
 // SetStage moves a deploy to a pipeline status and records when it got there.
@@ -357,9 +446,11 @@ func (s *Store) SetStage(ctx context.Context, id int64, status Status) error {
 	return tx.Commit()
 }
 
-// SetArtifacts records the image and container a deploy produced.
-func (s *Store) SetArtifacts(ctx context.Context, id int64, image, container string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE deploys SET image = ?, container = ? WHERE id = ?`, image, container, id)
+// AssignRelease records what a deploy is about to run and what it replaces.
+func (s *Store) AssignRelease(ctx context.Context, id int64, r Release, container string, previous *int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE deploys SET release_id = ?, image = ?, commit_sha = ?, container = ?, previous_deploy_id = ?
+		WHERE id = ?`, r.ID, r.Image, r.CommitSHA, container, previous, id)
 	return err
 }
 

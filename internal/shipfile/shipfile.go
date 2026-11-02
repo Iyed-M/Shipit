@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -19,6 +21,9 @@ const (
 	DefaultMemory = "512m"
 	DefaultCPUs   = 0.5
 )
+
+// memoryLimit is the form docker run accepts, such as 512m or 1g.
+var memoryLimit = regexp.MustCompile(`(?i)^[1-9][0-9]*[bkmg]?$`)
 
 // File is the parsed contents of shipit.toml.
 type File struct {
@@ -55,5 +60,22 @@ func Load(dir string) (File, error) {
 	if unknown := md.Undecoded(); len(unknown) > 0 {
 		return File{}, fmt.Errorf("parse %s: unknown key %q", Name, unknown[0].String())
 	}
+	if err := f.validate(); err != nil {
+		return File{}, fmt.Errorf("invalid %s: %w", Name, err)
+	}
 	return f, nil
+}
+
+func (f File) validate() error {
+	if f.Health.Path != "" && !strings.HasPrefix(f.Health.Path, "/") {
+		return fmt.Errorf("health.path %q must start with /", f.Health.Path)
+	}
+	// Docker reads 0 as no limit, so these checks are what keep an app capped.
+	if !memoryLimit.MatchString(f.Resources.Memory) {
+		return fmt.Errorf("resources.memory %q must look like 512m or 1g", f.Resources.Memory)
+	}
+	if f.Resources.CPUs <= 0 {
+		return fmt.Errorf("resources.cpus must be above 0, got %v", f.Resources.CPUs)
+	}
+	return nil
 }

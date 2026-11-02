@@ -49,8 +49,13 @@ cpus = 1.5
 
 func TestRejectsInvalidFiles(t *testing.T) {
 	for name, content := range map[string]string{
-		"syntax":      "[test",
-		"unknown key": "[tests]\ncommand = \"x\"\n",
+		"syntax":               "[test",
+		"unknown key":          "[tests]\ncommand = \"x\"\n",
+		"relative health path": "[health]\npath = \"healthz\"\n",
+		"unlimited memory":     "[resources]\nmemory = \"0\"\n",
+		"malformed memory":     "[resources]\nmemory = \"lots\"\n",
+		"unlimited cpus":       "[resources]\ncpus = 0.0\n",
+		"negative cpus":        "[resources]\ncpus = -1.0\n",
 	} {
 		if _, err := Load(write(t, content)); err == nil {
 			t.Errorf("%s: expected error", name)

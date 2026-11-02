@@ -13,6 +13,8 @@ services:
       - caddy-admin:/run/caddy
     networks:
       - internal
+      # Shipit health-checks new containers here, before they get any traffic.
+      - apps
 
   caddy:
     image: caddy:2-alpine
@@ -36,8 +38,9 @@ services:
 
 networks:
   internal:
-  # Apps join this network by name, so Caddy can reach them. Shipit's API and
-  # Caddy's admin socket aren't exposed on it.
+  # Apps join this network by name, so Caddy and Shipit can reach them. Apps can
+  # reach Shipit's API here, but it needs the admin token, as it does publicly.
+  # Caddy's admin API is on a socket, so it isn't exposed.
   apps:
     name: shipit-apps
 

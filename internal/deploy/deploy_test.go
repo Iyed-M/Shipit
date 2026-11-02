@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Iyed-M/Shipit/internal/docker"
 	"github.com/Iyed-M/Shipit/internal/github"
@@ -19,20 +21,41 @@ import (
 const sha = "0123456789abcdef0123456789abcdef01234567"
 
 type fakeRuntime struct {
+	mu                          sync.Mutex
 	buildErr, testErr, startErr error
-	tests                       []string
-	started                     []docker.Container
-	removed                     []string
+	// onBuild, if set, runs during a build.
+	onBuild       func()
+	builds        int
+	tests         []string
+	started       []docker.Container
+	removed       []string
+	removedImages []string
+	// states overrides what Inspect says about a container, which is otherwise
+	// a healthy one.
+	states map[string]docker.State
 }
 
-func (f *fakeRuntime) Build(context.Context, string, string, io.Writer) error { return f.buildErr }
+func (f *fakeRuntime) Build(context.Context, string, string, io.Writer) error {
+	f.mu.Lock()
+	f.builds++
+	onBuild := f.onBuild
+	f.mu.Unlock()
+	if onBuild != nil {
+		onBuild()
+	}
+	return f.buildErr
+}
 
 func (f *fakeRuntime) Test(_ context.Context, _, _, command string, _ io.Writer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.tests = append(f.tests, command)
 	return f.testErr
 }
 
 func (f *fakeRuntime) Start(_ context.Context, c docker.Container) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.startErr != nil {
 		return f.startErr
 	}
@@ -40,14 +63,79 @@ func (f *fakeRuntime) Start(_ context.Context, c docker.Container) error {
 	return nil
 }
 
+func (f *fakeRuntime) Inspect(_ context.Context, name string) (docker.State, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if state, ok := f.states[name]; ok {
+		return state, nil
+	}
+	return docker.State{Running: true, IP: "10.0.0.2"}, nil
+}
+
+func (f *fakeRuntime) setState(name string, state docker.State) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.states == nil {
+		f.states = map[string]docker.State{}
+	}
+	f.states[name] = state
+}
+
+func (f *fakeRuntime) Logs(_ context.Context, _ string, _ int, w io.Writer) error {
+	_, err := io.WriteString(w, "app says goodbye\n")
+	return err
+}
+
 func (f *fakeRuntime) Remove(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.removed = append(f.removed, name)
 	return nil
 }
 
+func (f *fakeRuntime) RemoveImage(_ context.Context, tag string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedImages = append(f.removedImages, tag)
+	return nil
+}
+
+// last returns the most recently started container.
+func (f *fakeRuntime) last() docker.Container {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.started[len(f.started)-1]
+}
+
+// fakeProber passes every check unless results scripts the next ones.
+type fakeProber struct {
+	mu      sync.Mutex
+	err     error
+	results []error
+	addrs   []string
+	hosts   []string
+	paths   []string
+}
+
+func (f *fakeProber) Probe(_ context.Context, addr, host, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addrs = append(f.addrs, addr)
+	f.hosts = append(f.hosts, host)
+	f.paths = append(f.paths, path)
+	if len(f.results) > 0 {
+		err := f.results[0]
+		f.results = f.results[1:]
+		return err
+	}
+	return f.err
+}
+
 type fakeSource struct {
+	mu       sync.Mutex
 	files    map[string]string
 	statuses []string
+	details  []string
 }
 
 func (f *fakeSource) Fetch(_ context.Context, _ github.Repo, _, dir string, _ io.Writer) error {
@@ -59,8 +147,11 @@ func (f *fakeSource) Fetch(_ context.Context, _ github.Repo, _, dir string, _ io
 	return nil
 }
 
-func (f *fakeSource) SetStatus(_ context.Context, _ github.Repo, _, state, _, _ string) error {
+func (f *fakeSource) SetStatus(_ context.Context, _ github.Repo, _, state, description, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.statuses = append(f.statuses, state)
+	f.details = append(f.details, description)
 	return nil
 }
 
@@ -77,6 +168,7 @@ func (f *fakeRouter) Sync(context.Context) error {
 type harness struct {
 	store    *store.Store
 	runtime  *fakeRuntime
+	prober   *fakeProber
 	source   *fakeSource
 	router   *fakeRouter
 	pipeline *Pipeline
@@ -89,7 +181,7 @@ func newHarness(t *testing.T) *harness {
 	if err := os.MkdirAll(filepath.Join(dir, "builds"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(filepath.Join(dir, "shipit.db"))
+	s, err := store.Open(filepath.Join(dir, "shipit.db"), make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,28 +197,98 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{
 		store:   s,
 		runtime: &fakeRuntime{},
+		prober:  &fakeProber{},
 		source:  &fakeSource{files: map[string]string{"Dockerfile": "FROM scratch\n"}},
 		router:  &fakeRouter{},
 		project: project,
 	}
-	h.pipeline = NewPipeline(Config{DataDir: dir, AppsNetwork: "apps", Domain: "ship.test"},
-		s, h.runtime, h.source, h.router, slog.New(slog.DiscardHandler))
+	h.pipeline = NewPipeline(Config{
+		DataDir:     dir,
+		AppsNetwork: "apps",
+		Domain:      "ship.test",
+		Timing:      Timing{HealthTimeout: 50 * time.Millisecond, HealthInterval: time.Millisecond},
+	}, s, h.runtime, h.prober, h.source, h.router, slog.New(slog.DiscardHandler))
 	return h
+}
+
+// enqueue queues a push without running it.
+func (h *harness) enqueue(t *testing.T, delivery string) store.Deploy {
+	t.Helper()
+	d, created, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{
+		ProjectID: h.project.ID, Kind: store.KindPush, CommitSHA: sha, Message: "msg", Key: delivery,
+	})
+	if err != nil || !created {
+		t.Fatalf("enqueue: created=%v err=%v", created, err)
+	}
+	return d
+}
+
+// run works through both queue lanes.
+func (h *harness) run(t *testing.T) {
+	t.Helper()
+	h.pipeline.drain(t.Context(), store.LaneBuild)
+	h.pipeline.drain(t.Context(), store.LaneRelease)
+}
+
+func (h *harness) deploy(t *testing.T, id int64) store.Deploy {
+	t.Helper()
+	d, err := h.store.Deploy(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func (h *harness) currentProject(t *testing.T) store.Project {
+	t.Helper()
+	p, err := h.store.Project(t.Context(), h.project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// changeEnv changes a var the way the API does, and applies it.
+func (h *harness) changeEnv(t *testing.T, name, value string) store.Deploy {
+	t.Helper()
+	if _, err := h.store.UpdateEnv(t.Context(), h.project.ID, map[string]*string{name: &value}); err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := h.store.EnqueueDeploy(t.Context(), store.NewDeploy{
+		ProjectID: h.project.ID, Kind: store.KindEnv, CommitSHA: sha, Message: "Update env vars",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.run(t)
+	return h.deploy(t, queued.ID)
+}
+
+// rollback requests and applies a rollback.
+func (h *harness) rollback(t *testing.T, release *int64) store.Deploy {
+	t.Helper()
+	queued, err := h.pipeline.Rollback(t.Context(), h.currentProject(t), release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.run(t)
+	return h.deploy(t, queued.ID)
+}
+
+// crash makes the live container report restarts crashes in total and runs one
+// round of the watcher.
+func (h *harness) crash(t *testing.T, container string, restarts int, at time.Time) {
+	t.Helper()
+	h.runtime.setState(container, docker.State{Running: true, IP: "10.0.0.2", RestartCount: restarts, FinishedAt: at})
+	h.pipeline.checkCrashes(t.Context())
 }
 
 // push queues a commit and runs the pipeline until the queue is empty.
 func (h *harness) push(t *testing.T, delivery string) store.Deploy {
 	t.Helper()
-	queued, created, err := h.store.EnqueueDeploy(t.Context(), h.project.ID, sha, "msg", delivery)
-	if err != nil || !created {
-		t.Fatalf("enqueue: created=%v err=%v", created, err)
-	}
-	h.pipeline.drain(t.Context())
-	d, err := h.store.Deploy(t.Context(), queued.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return d
+	queued := h.enqueue(t, delivery)
+	h.run(t)
+	return h.deploy(t, queued.ID)
 }
 
 func (h *harness) liveDeploy(t *testing.T) *int64 {
@@ -159,7 +321,10 @@ func TestDeployGoesLive(t *testing.T) {
 	if d.Status != store.StatusLive {
 		t.Fatalf("status = %s (%s)", d.Status, d.Error)
 	}
-	want := []store.Status{store.StatusQueued, store.StatusCloning, store.StatusBuilding, store.StatusStarting, store.StatusLive}
+	want := []store.Status{
+		store.StatusQueued, store.StatusCloning, store.StatusBuilding,
+		store.StatusStarting, store.StatusHealthChecking, store.StatusLive,
+	}
 	if got := h.stages(t, d.ID); !slices.Equal(got, want) {
 		t.Errorf("stages = %v, want %v", got, want)
 	}
@@ -256,6 +421,36 @@ func TestFailedDeployKeepsCurrentVersion(t *testing.T) {
 			reason:  "boom",
 			removes: true,
 		},
+		{
+			name:    "health check never passes",
+			arrange: func(h *harness) { h.prober.err = boom },
+			reason:  "health check timed out",
+			removes: true,
+		},
+		{
+			name: "app exits during the health check",
+			arrange: func(h *harness) {
+				h.runtime.setState("shipit-demo-2", docker.State{Running: true, Restarting: true, ExitCode: 7})
+			},
+			reason:  "exited with code 7",
+			removes: true,
+		},
+		{
+			name: "app restarts during the health check",
+			arrange: func(h *harness) {
+				h.runtime.setState("shipit-demo-2", docker.State{Running: true, IP: "10.0.0.2", RestartCount: 1})
+			},
+			reason:  "crashed during the health check",
+			removes: true,
+		},
+		{
+			name: "app runs out of memory",
+			arrange: func(h *harness) {
+				h.runtime.setState("shipit-demo-2", docker.State{OOMKilled: true})
+			},
+			reason:  "out of memory",
+			removes: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -290,10 +485,7 @@ func TestRecoverFailsInterruptedDeploys(t *testing.T) {
 	h := newHarness(t)
 	good := h.push(t, "good")
 
-	stuck, _, err := h.store.EnqueueDeploy(t.Context(), h.project.ID, sha, "msg", "stuck")
-	if err != nil {
-		t.Fatal(err)
-	}
+	stuck := h.enqueue(t, "stuck")
 	if err := h.store.SetStage(t.Context(), stuck.ID, store.StatusBuilding); err != nil {
 		t.Fatal(err)
 	}
@@ -320,10 +512,7 @@ func TestRecoverFailsInterruptedDeploys(t *testing.T) {
 
 func TestCancelledDeployIsRecorded(t *testing.T) {
 	h := newHarness(t)
-	queued, _, err := h.store.EnqueueDeploy(t.Context(), h.project.ID, sha, "msg", "a")
-	if err != nil {
-		t.Fatal(err)
-	}
+	queued := h.enqueue(t, "a")
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 

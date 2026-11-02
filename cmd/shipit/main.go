@@ -46,7 +46,7 @@ func run(log *slog.Logger) error {
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "builds"), 0o750); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
-	db, err := store.Open(filepath.Join(cfg.DataDir, "shipit.db"))
+	db, err := store.Open(filepath.Join(cfg.DataDir, "shipit.db"), cfg.MasterKey)
 	if err != nil {
 		return err
 	}
@@ -64,7 +64,8 @@ func run(log *slog.Logger) error {
 		DataDir:     cfg.DataDir,
 		AppsNetwork: cfg.AppsNetwork,
 		Domain:      cfg.Domain,
-	}, db, docker.CLI{}, gh, router, log)
+		Timing:      deploy.DefaultTiming(),
+	}, db, docker.CLI{}, deploy.NetworkProber{}, gh, router, log)
 
 	if err := pipeline.Recover(ctx); err != nil {
 		return err
